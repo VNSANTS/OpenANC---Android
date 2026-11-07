@@ -33,8 +33,8 @@ jobs:
       - name: Publicar APK em Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: OpenANC 1.0.0 - Experimental
-          body: 'APK experimental. Exclusivo para fones com fio. ANC não garantido. Use volume baixo.'
+          tag_name: v1.1.0
+          name: OpenANC 1.1.0 - Dual Mic Experimental
+          body: 'Experimental: tenta captar dois microfones distintos no Android e combina só quando há coerência alta; fallback seguro. ANC e supressão de vozes não garantidos. Volume baixo.'
           files: app/build/outputs/apk/debug/app-debug.apk
           fail_on_unmatched_files: true

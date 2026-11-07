@@ -42,7 +42,12 @@ public final class MainActivity extends Activity {
     private final ArrayList<AudioDeviceInfo> headphones=new ArrayList<>();
     private AudioManager manager;
     private AudioDeviceCallback deviceCallback;
-    private Spinner micList,outputList,profiles;
+    private Spinner micList,outputList,profiles,captureMode;
+    private TextView dualInfo;
+    private volatile DualMicCapture dualCapture;
+    private volatile String dualState="Modo simples: somente um microfone.";
+    private volatile long mixedBlocks=0;
+    private volatile int recordingDeviceId=-1;
     private SeekBar gainBar,cutoffBar,delayBar;
     private TextView gainLabel,cutoffLabel,delayLabel,status,devicesInfo,meters;
     private Button power;
@@ -71,7 +76,7 @@ public final class MainActivity extends Activity {
         space(page,18);
         LinearLayout intro=card(page);
         text(intro,"🎧  PROCESSAMENTO AO VIVO",18,TEXT,true);
-        text(intro,"Capta o som ambiente, filtra os graves e envia uma onda invertida aos fones com fio.",14,DIM,false);
+        text(intro,"Experimenta usar o microfone do fone e do celular, verifica o roteamento, filtra graves e produz antirruído em fones com fio.",14,DIM,false);
         status=text(intro,"● Desligado",16,DIM,true);
         space(page,15);
 
@@ -81,6 +86,10 @@ public final class MainActivity extends Activity {
         micList=spinner(io);
         text(io,"Saída em fones com fio",14,TEXT,true);
         outputList=spinner(io);
+        text(io,"Captação com 2 microfones",14,TEXT,true);
+        captureMode=spinner(io);
+        captureMode.setAdapter(adapter(new String[]{"Automático: fone + celular (experimental)", "Somente microfone selecionado"}));
+        dualInfo=text(io,"No modo automático, o segundo microfone só é usado quando o Android permitir.",12,DIM,false);
         devicesInfo=text(io,"Conecte um fone P2 ou USB para começar.",12,DIM,false);
         space(page,15);
 
@@ -128,7 +137,7 @@ public final class MainActivity extends Activity {
         page.addView(power,new LinearLayout.LayoutParams(-1,px(62)));
         power.setOnClickListener(v->{if(running.get())stop("Parado pelo usuário.",false);else start();});
         space(page,14);
-        TextView warning=text(page,"⚠ EXPERIMENTO: inverter o som não garante ANC no ouvido. A latência pode aumentar o ruído. Use volume baixo, pare ao ouvir apitos ou desconforto e nunca use no trânsito ou perto de máquinas.",13,DIM,false);
+        TextView warning=text(page,"⚠ EXPERIMENTO: os 2 microfones podem não operar simultaneamente. A combinação só entra com correlação alta; isso não mede cancelamento no ouvido. Não há garantia de abafar vozes. Volume baixo, pare ao ouvir apitos e não use no trânsito.",13,DIM,false);
         warning.setLineSpacing(px(3),1f);
 
         deviceCallback=new AudioDeviceCallback(){
@@ -151,8 +160,10 @@ public final class MainActivity extends Activity {
         @Override public void run(){
             if(running.get()){
                 meters.setText(String.format(Locale.US,
-                  "Entrada RMS  %.1f dBFS\nPico de entrada  %.1f dBFS\nAmostras processadas  %,d\nBlocos incompletos  %,d",
-                  dB(rms),dB(peak),frames,shortBlocks));
+                  "Entrada RMS  %.1f dBFS\nPico de entrada  %.1f dBFS\nAmostras processadas  %,d\nBlocos incompletos  %,d\nBlocos mesclados  %,d",
+                  dB(rms),dB(peak),frames,shortBlocks,mixedBlocks));
+                DualMicCapture dc=dualCapture;
+                dualInfo.setText(dc==null?dualState:dc.status());
             }
             ui.postDelayed(this,350);
         }
@@ -232,11 +243,30 @@ public final class MainActivity extends Activity {
         if(ins.isEmpty())ins.add("Microfone indisponível");
         if(outs.isEmpty())outs.add("Nenhum fone com fio detectado");
         micList.setAdapter(adapter(ins.toArray(new String[0])));
+        // O microfone mais próximo do ouvido é a referência principal por padrão.
+        for(int k=0;k<microphones.size();k++){
+            int t=microphones.get(k).getType();
+            if(t==AudioDeviceInfo.TYPE_WIRED_HEADSET||t==AudioDeviceInfo.TYPE_USB_HEADSET){
+                micList.setSelection(k);break;
+            }
+        }
         outputList.setAdapter(adapter(outs.toArray(new String[0])));
         devicesInfo.setText(headphones.isEmpty()?
             "Conecte um fone com fio. Bluetooth e alto-falante não são permitidos.":
             "✓ Saída com fio detectada. O app funciona sem internet.");
         power.setEnabled(!microphones.isEmpty()&&!headphones.isEmpty());
+    }
+    private AudioDeviceInfo secondMicrophone(AudioDeviceInfo primary){
+        int type=primary.getType();
+        boolean primaryPhone=type==AudioDeviceInfo.TYPE_BUILTIN_MIC;
+        for(AudioDeviceInfo dev:microphones){
+            if(dev.getId()==primary.getId())continue;
+            int t=dev.getType();
+            if(primaryPhone){
+                if(t==AudioDeviceInfo.TYPE_WIRED_HEADSET||t==AudioDeviceInfo.TYPE_USB_HEADSET)return dev;
+            }else if(t==AudioDeviceInfo.TYPE_BUILTIN_MIC)return dev;
+        }
+        return null;
     }
     private void status(String message,boolean error){
         status.setText("● "+message);
@@ -285,16 +315,30 @@ public final class MainActivity extends Activity {
             if(!rec.setPreferredDevice(in)||!track.setPreferredDevice(out))
                 throw new IllegalStateException("Android recusou o microfone ou a saída selecionada.");
             recorder=rec;player=track;
-            peak=0;rms=0;frames=0;shortBlocks=0;
-            playingDeviceId=out.getId();
+            dualCapture=null;
+            dualState="Modo simples. Selecione automático e conecte um headset com microfone.";
+            if(captureMode.getSelectedItemPosition()==0){
+                AudioDeviceInfo second=secondMicrophone(in);
+                if(second!=null){
+                    try{
+                        dualCapture=new DualMicCapture(second,in.getId(),SAMPLE_RATE,BLOCK,manager);
+                        dualState="Tentando captar de "+deviceName(second)+" simultaneamente.";
+                    }catch(Exception ex){
+                        dualState="Dois microfones indisponíveis: "+ex.getMessage()+"; continuando com o principal.";
+                    }
+                }else dualState="Segundo microfone físico não encontrado; modo simples.";
+            }
+            peak=0;rms=0;frames=0;shortBlocks=0;mixedBlocks=0;
+            playingDeviceId=out.getId();recordingDeviceId=in.getId();
             running.set(true);
             power.setText("PARAR IMEDIATAMENTE");
             power.setBackground(background(RED,16));
-            micList.setEnabled(false);outputList.setEnabled(false);
+            micList.setEnabled(false);outputList.setEnabled(false);captureMode.setEnabled(false);
             status("Processamento ativo",false);
             final AudioRecord useRec=rec;
             final AudioTrack useTrack=track;
-            audioThread=new Thread(()->process(useRec,useTrack,out.getId()),"openanc-audio");
+            final DualMicCapture useDual=dualCapture;
+            audioThread=new Thread(()->process(useRec,useTrack,out.getId(),useDual),"openanc-audio");
             audioThread.start();
         }catch(Throwable problem){
             if(rec!=null){try{rec.release();}catch(Exception ignored){}}
@@ -303,7 +347,7 @@ public final class MainActivity extends Activity {
             status("Falha: "+problem.getMessage(),true);
         }
     }
-    private void process(AudioRecord rec,AudioTrack track,int outId){
+    private void process(AudioRecord rec,AudioTrack track,int outId,DualMicCapture dual){
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         float[] input=new float[BLOCK],stereo=new float[BLOCK*2];
         float[] fifo=new float[SAMPLE_RATE/50+2];
@@ -311,14 +355,36 @@ public final class MainActivity extends Activity {
         double hp=0,previous=0,lp=0;
         try {
             rec.startRecording();
+            if(dual!=null)dual.start();
             track.play();
             while(running.get()){
                 AudioDeviceInfo physical=track.getRoutedDevice();
                 if(physical!=null&&(!wired(physical)||physical.getId()!=outId))
                     throw new IllegalStateException("A rota mudou; áudio interrompido.");
+                AudioDeviceInfo routedInput=rec.getRoutedDevice();
+                if(routedInput!=null&&routedInput.getId()!=recordingDeviceId)
+                    throw new IllegalStateException("O Android mudou o microfone principal; áudio interrompido.");
                 int read=rec.read(input,0,BLOCK,AudioRecord.READ_BLOCKING);
                 if(read<0)throw new IllegalStateException("Falha ao ler microfone: "+read);
                 if(read==0){shortBlocks++;continue;}
+                // Só fundir as duas fontes se houver sinal simultâneo, coerente e alinhável.
+                // Caso contrário, evitar piorar ruído com a soma descontrolada de fases.
+                float[] secondary=dual==null?null:dual.recentBlock();
+                int bestLag=0; double bestCorrelation=0;
+                if(secondary!=null&&secondary.length==read){
+                    for(int lag=-24;lag<=24;lag+=4){
+                        int start=Math.max(0,-lag),end=Math.min(read,read-lag);
+                        double dot=0,a=0,b=0;
+                        for(int k=start;k<end;k++){
+                            double x=input[k],y=secondary[k+lag];
+                            dot+=x*y;a+=x*x;b+=y*y;
+                        }
+                        double correlation=dot/Math.sqrt(a*b+1e-14);
+                        if(correlation>bestCorrelation){bestCorrelation=correlation;bestLag=lag;}
+                    }
+                }
+                boolean useBoth=bestCorrelation>=0.90;
+                if(useBoth)mixedBlocks++;
                 double energy=0,max=0;
                 double highPassFactor=Math.exp(-2*Math.PI*35/SAMPLE_RATE);
                 double lowPassFactor=1-Math.exp(-2*Math.PI*Math.max(80,cutoffHz)/SAMPLE_RATE);
@@ -327,6 +393,10 @@ public final class MainActivity extends Activity {
                 for(int k=0;k<read;k++){
                     double x=input[k];
                     energy+=x*x;max=Math.max(max,Math.abs(x));
+                    if(useBoth){
+                        int j=k+bestLag;
+                        if(j>=0&&j<read)x=x*0.88+secondary[j]*0.12;
+                    }
                     hp=highPassFactor*(hp+x-previous);previous=x;
                     lp+=lowPassFactor*(hp-lp);
                     fifo[pointer]=(float)lp;
@@ -351,6 +421,7 @@ public final class MainActivity extends Activity {
         }catch(Throwable problem){
             if(running.get())ui.post(()->stop("Proteção: "+problem.getMessage(),true));
         }finally {
+            if(dual!=null)dual.close();
             try{track.pause();track.flush();}catch(Exception ignored){}
             try{rec.stop();}catch(Exception ignored){}
             try{track.release();}catch(Exception ignored){}
@@ -360,12 +431,15 @@ public final class MainActivity extends Activity {
     private void stop(String reason,boolean error){
         if(!running.getAndSet(false))return;
         AudioRecord rec=recorder;AudioTrack track=player;
-        recorder=null;player=null;playingDeviceId=-1;
+        recorder=null;player=null;playingDeviceId=-1;recordingDeviceId=-1;
+        DualMicCapture dc=dualCapture;dualCapture=null;
+        if(dc!=null)dc.close();
         try{if(rec!=null)rec.stop();}catch(Exception ignored){}
         try{if(track!=null)track.pause();}catch(Exception ignored){}
         power.setText("INICIAR ANTIRRUÍDO");
         power.setBackground(background(MINT,16));
-        micList.setEnabled(true);outputList.setEnabled(true);
+        micList.setEnabled(true);outputList.setEnabled(true);captureMode.setEnabled(true);
+        dualInfo.setText(dualState);
         status(reason,error);
         refreshDevices();
     }
